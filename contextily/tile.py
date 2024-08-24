@@ -1,5 +1,4 @@
 """Tools for downloading map tiles from coordinates."""
-
 from __future__ import absolute_import, division, print_function
 
 import uuid
@@ -8,7 +7,7 @@ import mercantile as mt
 import requests
 import atexit
 import io
-import time
+import os
 import shutil
 import tempfile
 import warnings
@@ -59,7 +58,7 @@ def set_cache_dir(path):
 
 
 def _clear_cache():
-    shutil.rmtree(tmpdir, ignore_errors=True)
+    shutil.rmtree(tmpdir)
 
 
 atexit.register(_clear_cache)
@@ -141,17 +140,8 @@ def bounds2raster(
         w, s = _sm2ll(w, s)
         e, n = _sm2ll(e, n)
     # Download
-    Z, ext = bounds2img(
-        w,
-        s,
-        e,
-        n,
-        zoom=zoom,
-        source=source,
-        ll=True,
-        n_connections=n_connections,
-        use_cache=use_cache,
-    )
+    Z, ext = bounds2img(w, s, e, n, zoom=zoom, source=source, ll=True, n_connections=n_connections,
+                        use_cache=use_cache)
 
     # Write
     # ---
@@ -181,18 +171,7 @@ def bounds2raster(
 
 
 def bounds2img(
-    w,
-    s,
-    e,
-    n,
-    zoom="auto",
-    source=None,
-    ll=False,
-    wait=0,
-    max_retries=2,
-    n_connections=1,
-    use_cache=True,
-    zoom_adjust=None,
+    w, s, e, n, zoom="auto", source=None, ll=False, wait=0, max_retries=2, n_connections=1, use_cache=True, zoom_adjust=None
 ):
     """
     Take bounding box and zoom and return an image with all the tiles
@@ -259,7 +238,7 @@ def bounds2img(
         e, n = _sm2ll(e, n)
 
     # get provider dict given the url
-    provider = _process_source(source)
+    provider = _process_source(source.replace('{-y}','{y}'))
     # calculate and validate zoom level
     auto_zoom = zoom == "auto"
     if auto_zoom:
@@ -269,22 +248,44 @@ def bounds2img(
     zoom = _validate_zoom(zoom, provider, auto=auto_zoom)
     # create list of tiles to download
     tiles = list(mt.tiles(w, s, e, n, [zoom]))
+    # flipY is a boolean value to indicate whether the tiles' y values follow TMS convention (flipY = True) or XYZ (flipY = False)
+    debug = False # used for debugging purposes
+    if "{-y}" in source:
+        flipY = True
+        flippedY_tiles = [] # list of tiles with inverted y values
+        for ti in tiles:
+            if debug: print("original ti.y:",type(ti.y),ti.y)
+            new_y_value = invert_y_tile(ti.y,ti.z)
+            if debug: print("inverted ti.y:",type(new_y_value),new_y_value)
+            # tried several ways for updating ti object with new y value:
+            # ti['y'] = new_y_value # TypeError: 'Tile' object does not support item assignment
+            # setattr(ti, 'y', new_y_value) # AttributeError: can't set attribute
+            # https://stackoverflow.com/questions/8542343/object-does-not-support-item-assignment-error/8542369#8542369
+            ti = ti._replace(y=new_y_value) # not sure if this is the best way to update ti.y value
+            if debug: print("final ti.y:",type(ti.y),ti.y)
+            flippedY_tiles.append(ti)
+        # change source string value so it 
+        # source = source.replace('{-y}','{y}')
+        if debug: print("\n*** {} original tiles: ".format(len(tiles)),tiles)
+        tiles = flippedY_tiles
+        if debug: print("\n*** {} inverted-y tiles: \n".format(len(tiles)),tiles)
+    else:
+        flipY = False
     tile_urls = [provider.build_url(x=tile.x, y=tile.y, z=tile.z) for tile in tiles]
     # download tiles
     if n_connections < 1 or not isinstance(n_connections, int):
-        raise ValueError(f"n_connections must be a positive integer value.")
+        raise ValueError(
+            f"n_connections must be a positive integer value."
+        )
     # Use threads for a single connection to avoid the overhead of spawning a process. Use processes for multiple
     # connections if caching is enabled, as threads lead to memory issues when used in combination with the joblib
     # memory caching (used for the _fetch_tile() function).
-    preferred_backend = (
-        "threads" if (n_connections == 1 or not use_cache) else "processes"
-    )
+    preferred_backend = "threads" if (n_connections == 1 or not use_cache) else "processes"
     fetch_tile_fn = memory.cache(_fetch_tile) if use_cache else _fetch_tile
     arrays = Parallel(n_jobs=n_connections, prefer=preferred_backend)(
-        delayed(fetch_tile_fn)(tile_url, wait, max_retries) for tile_url in tile_urls
-    )
+        delayed(fetch_tile_fn)(tile_url, wait, max_retries) for tile_url in tile_urls)
     # merge downloaded tiles
-    merged, extent = _merge_tiles(tiles, arrays)
+    merged, extent = _merge_tiles(tiles, arrays, flipY=flipY)
     # lon/lat extent --> Spheric Mercator
     west, south, east, north = extent
     left, bottom = mt.xy(west, south)
@@ -464,15 +465,15 @@ def _retryer(tile_url, wait, max_retries):
                 "Tile URL resulted in a 404 error. "
                 "Double-check your tile url:\n{}".format(tile_url)
             )
-        else:
+        elif request.status_code == 104 or request.status_code == 200:
             if max_retries > 0:
-                time.sleep(wait)
+                os.wait(wait)
                 max_retries -= 1
                 request = _retryer(tile_url, wait, max_retries)
             else:
-                raise requests.HTTPError("Connection reset by peer too many times. "
-                                         f"Last message was: {request.status_code} "
-                                         f"Error: {request.reason} for url: {request.url}")
+                raise requests.HTTPError("Connection reset by peer too many times.")
+
+
 
 def howmany(w, s, e, n, zoom, verbose=True, ll=False):
     """
@@ -652,7 +653,7 @@ def _validate_zoom(zoom, provider, auto=True):
     raise ValueError(msg)
 
 
-def _merge_tiles(tiles, arrays):
+def _merge_tiles(tiles, arrays, flipY=False):
     """
     Merge a set of tiles into a single array.
 
@@ -672,6 +673,13 @@ def _merge_tiles(tiles, arrays):
         Bounding box [west, south, east, north] of the returned image
         in long/lat.
     """
+    if flipY:
+        flippedY_tiles=[]
+        for ti in tiles:
+            new_y_value = invert_y_tile(ti.y,ti.z)
+            ti = ti._replace(y=new_y_value)
+            flippedY_tiles.append(ti)
+        tiles = flippedY_tiles
     # create (n_tiles x 2) array with column for x and y coordinates
     tile_xys = np.array([(t.x, t.y) for t in tiles])
 
@@ -689,7 +697,10 @@ def _merge_tiles(tiles, arrays):
 
     for ind, arr in zip(indices, arrays):
         x, y = ind
-        img[y * h : (y + 1) * h, x * w : (x + 1) * w, :] = arr
+        try:
+            img[y * h : (y + 1) * h, x * w : (x + 1) * w, :] = arr
+        except:
+            print("Merging error (x,y,w,h,arr):",x,y,w,h,arr)
 
     bounds = np.array([mt.bounds(t) for t in tiles])
     west, south, east, north = (
@@ -700,3 +711,13 @@ def _merge_tiles(tiles, arrays):
     )
 
     return img, (west, south, east, north)
+
+
+def invert_y_tile(original_y,zoom):
+    """ In 'xyz system' (OSM tiles), tile.y values use a different axis origin compared to that of 'TMS system' (providers with {-y} in tile-source url): https://gist.github.com/tmcw/4954720
+        
+        Function returns new Y value
+        """
+    new_y_value = (2 ** zoom) - original_y - 1
+    return new_y_value
+
